@@ -11,7 +11,10 @@ __pycache__/
 venv/
 env/
 .venv/
-.env/
+
+
+.wandb/
+wandb/
 
 # ┌───────────────────────────────────────────────────
 # │ AI/ML model checkpoints & data
@@ -35,3 +38,5 @@ env/
 
 
 LLaVA-Pretrain/
+
+config.json
