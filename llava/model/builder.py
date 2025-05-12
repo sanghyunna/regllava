@@ -22,178 +22,146 @@ import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-import os
-import warnings
-import shutil
-import torch
-from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig,
-    LlamaConfig, PretrainedConfig          # ← 추가 import
-)
-from llava.model import *
-from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-
-def _sanitize_llava_cfg(cfg):
-    """
-    LLaVA는 causal‑LM 이므로 encoder‑decoder 관련 dict 속성을 정리한다.
-    """
-    cfg.is_encoder_decoder = False
-    # decoder: dict → LlamaConfig, 아니면 제거
-    dec = getattr(cfg, "decoder", None)
-    if isinstance(dec, dict):
-        try:
-            cfg.decoder = LlamaConfig(**dec, is_decoder=True)
-        except TypeError:
-            delattr(cfg, "decoder")
-    elif not isinstance(dec, PretrainedConfig) and hasattr(cfg, "decoder"):
-        delattr(cfg, "decoder")
-    # encoder: dict 제거
-    if isinstance(getattr(cfg, "encoder", None), dict):
-        delattr(cfg, "encoder")
-    return cfg
-
-import os, warnings, shutil, torch
-from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig,
-    LlamaConfig, PretrainedConfig
-)
-from llava.model import *
-from llava.constants import (
-    DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-)
-
-# ──────────────────────────────────────────────────────────────────────────
-def _sanitize_llava_cfg(cfg):
-    """
-    LLaVA는 causal‑LM 이므로 encoder‑decoder 관련 dict 속성을 정리한다.
-    • is_encoder_decoder → False
-    • decoder / encoder / text_config / vision_config
-      ─ dict → LlamaConfig(**dict) (가능할 때만)
-      ─ 아니면 완전히 삭제
-    """
-    cfg.is_encoder_decoder = False
-    for key in ("decoder", "encoder", "text_config", "vision_config"):
-        if not hasattr(cfg, key):
-            continue
-        val = getattr(cfg, key)
-        if isinstance(val, dict) and key == "decoder":
-            # dict → LlamaConfig  변환 시도
-            try:
-                setattr(cfg, key, LlamaConfig(**val, is_decoder=True))
-                continue
-            except TypeError:
-                pass  # 변환 실패 → 삭제
-        # dict 이거나 변환 실패했으면 제거
-        if isinstance(val, dict) or isinstance(val, PretrainedConfig):
-            delattr(cfg, key)
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def load_pretrained_model(
-    model_path,
-    model_base,
-    model_name,
-    load_8bit=False,
-    load_4bit=False,
-    device_map="auto",
-    device="cuda",
-    use_flash_attn=False,
-    **kwargs
-):
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
-        kwargs["device_map"] = {"": device}
+        kwargs['device_map'] = {"": device}
 
     if load_8bit:
-        kwargs["load_in_8bit"] = True
+        kwargs['load_in_8bit'] = True
     elif load_4bit:
-        kwargs["load_in_4bit"] = True
-        kwargs["quantization_config"] = BitsAndBytesConfig(
+        kwargs['load_in_4bit'] = True
+        kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
+            bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs["torch_dtype"] = torch.float16
+        kwargs['torch_dtype'] = torch.float16
 
     if use_flash_attn:
-        kwargs["attn_implementation"] = "flash_attention_2"
+        kwargs['attn_implementation'] = 'flash_attention_2'
 
-    # ────────────────────────── LLaVA 계열 ──────────────────────────
-    if "llava" in model_name.lower():
-        # -- (1) LoRA + base --
-        if "lora" in model_name.lower() and model_base is not None:
+    if 'llava' in model_name.lower():
+        # Load LLaVA model
+        if 'lora' in model_name.lower() and model_base is None:
+            warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
+        if 'lora' in model_name.lower() and model_base is not None:
             from llava.model.language_model.llava_llama import LlavaConfig
-            cfg = LlavaConfig.from_pretrained(model_path)
-            _sanitize_llava_cfg(cfg)
-
+            lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            print("Loading LLaVA from base model...")
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_base, low_cpu_mem_usage=True, config=cfg, **kwargs
-            )
-            # --- 이하 원본 로직 그대로 (생략) ---
-            # ...
+            print('Loading LLaVA from base model...')
+            model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+            token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
+            if model.lm_head.weight.shape[0] != token_num:
+                model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+                model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
 
-        # -- (2) base 모델 + mm_projector --
+            print('Loading additional LLaVA weights...')
+            if os.path.exists(os.path.join(model_path, 'non_lora_trainables.bin')):
+                non_lora_trainables = torch.load(os.path.join(model_path, 'non_lora_trainables.bin'), map_location='cpu')
+            else:
+                # this is probably from HF Hub
+                from huggingface_hub import hf_hub_download
+                def load_from_hf(repo_id, filename, subfolder=None):
+                    cache_file = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        subfolder=subfolder)
+                    return torch.load(cache_file, map_location='cpu')
+                non_lora_trainables = load_from_hf(model_path, 'non_lora_trainables.bin')
+            non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
+            if any(k.startswith('model.model.') for k in non_lora_trainables):
+                non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
+            model.load_state_dict(non_lora_trainables, strict=False)
+
+            from peft import PeftModel
+            print('Loading LoRA weights...')
+            model = PeftModel.from_pretrained(model, model_path)
+            print('Merging LoRA weights...')
+            model = model.merge_and_unload()
+            print('Model is loaded...')
         elif model_base is not None:
-            print("Loading LLaVA from base model...")
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
-            cfg = AutoConfig.from_pretrained(model_path)
-            _sanitize_llava_cfg(cfg)                    # ← 강화된 함수 호출
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_base, low_cpu_mem_usage=True, config=cfg, **kwargs
-            )
-            # --- projector 가중치 로드 (원본 그대로) ---
-            mm_proj = torch.load(os.path.join(model_path, "mm_projector.bin"), map_location="cpu")
-            model.load_state_dict({k: v.to(torch.float16) for k, v in mm_proj.items()}, strict=False)
+            # this may be mm projector only
+            print('Loading LLaVA from base model...')
+            if 'mpt' in model_name.lower():
+                if not os.path.isfile(os.path.join(model_path, 'configuration_mpt.py')):
+                    shutil.copyfile(os.path.join(model_base, 'configuration_mpt.py'), os.path.join(model_path, 'configuration_mpt.py'))
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=True)
+                cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                model = LlavaMptForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                cfg_pretrained = AutoConfig.from_pretrained(model_path)
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
-        # -- (3) 단일 LLaVA 체크포인트 --
+            mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
+            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+            model.load_state_dict(mm_projector_weights, strict=False)
         else:
-            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-            model = LlavaLlamaForCausalLM.from_pretrained(
-                model_path, low_cpu_mem_usage=True, **kwargs
-            )
-
-    # ───────────────────────── 일반 언어 모델 ─────────────────────────
+            if 'mpt' in model_name.lower():
+                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+                model = LlavaMptForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+            elif 'mistral' in model_name.lower():
+                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                model = LlavaMistralForCausalLM.from_pretrained(
+                    model_path,
+                    low_cpu_mem_usage=True,
+                    **kwargs
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+                model = LlavaLlamaForCausalLM.from_pretrained(
+                    model_path,
+                    low_cpu_mem_usage=True,
+                    **kwargs
+                )
     else:
-        # (원본 builder.py 로직 그대로 – 변경 없음)
+        # Load language model
         if model_base is not None:
+            # PEFT model
             from peft import PeftModel
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
-            model = PeftModel.from_pretrained(model, model_path).merge_and_unload().to(torch.float16)
+            print(f"Loading LoRA weights from {model_path}")
+            model = PeftModel.from_pretrained(model, model_path)
+            print(f"Merging weights")
+            model = model.merge_and_unload()
+            print('Convert to FP16...')
+            model.to(torch.float16)
         else:
-            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-            model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+            use_fast = False
+            if 'mpt' in model_name.lower():
+                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+                model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
-    # ─────────────── token 추가·vision tower 초기화 (변경 없음) ───────────────
     image_processor = None
-    if "llava" in model_name.lower():
-        if getattr(model.config, "mm_use_im_patch_token", True):
+
+    if 'llava' in model_name.lower():
+        mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+        mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
+        if mm_use_im_patch_token:
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
-        if getattr(model.config, "mm_use_im_start_end", False):
+        if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
         model.resize_token_embeddings(len(tokenizer))
 
-        vt = model.get_vision_tower()
-        if not vt.is_loaded:
-            vt.load_model(device_map=device_map)
+        vision_tower = model.get_vision_tower()
+        if not vision_tower.is_loaded:
+            vision_tower.load_model(device_map=device_map)
+        if device_map != 'auto':
+            vision_tower.to(device=device_map, dtype=torch.float16)
+        image_processor = vision_tower.image_processor
 
-        # ------------------------------------------------------------------
-        # device_map 이 dict 인 경우  ➔  하나의 실제 device 값만 추출해 사용
-        #   예) {"": "cuda:0"}  or  {"module": "cuda:1"}
-        # dict 그대로 넘기면 .to() 가 TypeError 를 발생시키므로 처리 필요
-        # ------------------------------------------------------------------
-        if isinstance(device_map, dict):
-            tgt_device = next(iter(device_map.values()))
-            vt.to(device=tgt_device, dtype=torch.float16)
-        elif device_map != "auto":
-            vt.to(device=device_map, dtype=torch.float16)
-        image_processor = vt.image_processor
+    if hasattr(model.config, "max_sequence_length"):
+        context_len = model.config.max_sequence_length
+    else:
+        context_len = 2048
 
-    context_len = getattr(model.config, "max_sequence_length", 2048)
     return tokenizer, model, image_processor, context_len

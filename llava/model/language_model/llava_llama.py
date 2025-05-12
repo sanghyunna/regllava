@@ -28,53 +28,24 @@ from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 
 class LlavaConfig(LlamaConfig):
-    """
-    LlavaConfig is the configuration class to store the configuration of a `LlavaLlamaModel`.
-    It is used to instantiate an LLaMA model according to the specified arguments, defining the model
-    architecture. Instantiating a configuration with the defaults will yield a similar configuration to that of
-    the LLaMA-7B.
-
-    Configuration objects inherit from [`LlamaConfig`] and can be used to control the model outputs. Read the
-    documentation from [`LlamaConfig`] for more information.
-    """
     model_type = "llava_llama"
-
-    def __init__(
-        self,
-        attention_dropout=0.0,  # Add attention_dropout with a default value
-        # You can add other Llava-specific config arguments here if needed,
-        # and pop them from kwargs before passing to super().__init__
-        # For example:
-        # mm_vision_tower=None,
-        **kwargs,
-    ):
-        super().__init__(attention_dropout=attention_dropout, **kwargs)
-        # If you had Llava-specific arguments popped from kwargs, assign them here:
-        # self.mm_vision_tower = mm_vision_tower
-
 
 
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
     config_class = LlavaConfig
 
-    def __init__(self, config: LlavaConfig):
+    def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
 
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
-    def __init__(self, config: LlavaConfig): # Changed type hint to LlavaConfig
+    def __init__(self, config):
         super(LlamaForCausalLM, self).__init__(config)
         self.model = LlavaLlamaModel(config)
-
-        # self.pretraining_tp and self.vocab_size are likely handled by LlamaForCausalLM's __init__
-        # If LlamaConfig (and thus LlavaConfig) has pretraining_tp, it should be fine.
-        # Verify if LlamaForCausalLM's __init__ correctly sets these based on the config.
-        # If not, uncomment and ensure they are correctly sourced from config.
-        # self.pretraining_tp = config.pretraining_tp 
-        # self.vocab_size = config.vocab_size
-
+        self.pretraining_tp = config.pretraining_tp
+        self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -83,8 +54,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
-    # NOTE: HF generate() (4.30↑) → forward(cache_position=…)
-    #       받아서 무시하거나 상위로 전달해야 에러가 나지 않는다.
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -99,8 +68,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -131,8 +98,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
+            return_dict=return_dict
         )
 
     @torch.no_grad()

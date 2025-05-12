@@ -1,12 +1,12 @@
 ATTNclipORG
 ATTNclipXGATED
 ComfyUI-workflows
+DeepSpeed
 EX-image-vis
 EX-tokens-vis
 INFERclipregXGATED
 LLaVA-Pretrain
 TRAINgmpCLIPregXGATED
-checkpoint-8700
 checkpoints
 evals_benchmarks_results
 evals_benchmarks_results_longclip

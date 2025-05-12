@@ -178,24 +178,6 @@ class LlavaMetaForCausalLM(ABC):
         else:
             print(f"경고: 알 수 없는 select_feature '{select_feature}', cls_patch로 처리")
             feats = feats[:, :num_cls_patch]
-        # ────────────────────────────────────────────────────────
-        # ★ NEW: vision‑tower 출력의 dtype / device 를 projector 기준으로 통일
-        #   • fp32 → fp16 충돌, multi‑GPU 충돌을 encode_images 내부에서 차단
-        #   • nn.Sequential · nn.Linear 어느 쪽 projector 도 지원
-        proj = self.get_model().mm_projector
-        if isinstance(proj, nn.Sequential):
-            first_linear = next((m for m in proj if isinstance(m, nn.Linear)), None)
-            w = first_linear.weight if first_linear is not None else None
-        elif isinstance(proj, nn.Linear):
-           w = proj.weight
-        else:
-            w = None
-
-        if w is not None:
-            tgt_dtype, tgt_device = w.dtype, w.device
-            if feats.dtype != tgt_dtype or feats.device != tgt_device:
-                feats = feats.to(device=tgt_device, dtype=tgt_dtype, non_blocking=True)
-        # ────────────────────────────────────────────────────────
 
         # ⑤ projector
         return self.get_model().mm_projector(feats)      # (B, N, proj_dim)

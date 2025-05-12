@@ -8,6 +8,7 @@ Classifier: Programming Language :: Python :: 3
 Classifier: License :: OSI Approved :: Apache Software License
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: torch
 Requires-Dist: torchvision
 Requires-Dist: transformers
@@ -37,6 +38,7 @@ Requires-Dist: wandb; extra == "train"
 Provides-Extra: build
 Requires-Dist: build; extra == "build"
 Requires-Dist: twine; extra == "build"
+Dynamic: license-file
 
 CLIP-fine-tune-registers-gated
 
