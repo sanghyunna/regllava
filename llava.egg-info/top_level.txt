@@ -4,10 +4,10 @@ ComfyUI-workflows
 EX-image-vis
 EX-tokens-vis
 INFERclipregXGATED
-LLaVA-Pretrain
 TRAINgmpCLIPregXGATED
 checkpoint-8700
 checkpoints
+data
 evals_benchmarks_results
 evals_benchmarks_results_longclip
 images
@@ -20,3 +20,4 @@ longmodel
 longregtokens
 models
 regtokens
+wandb

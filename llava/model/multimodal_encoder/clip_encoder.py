@@ -1,200 +1,146 @@
-import os
-import sys
-from pathlib import Path
+import warnings
 import torch
 import torch.nn as nn
+import os
+
+from safetensors.torch import load_file as load_safetensors
+from INFERclipregXGATED.model import build_model as build_reg_gated_clip
+from INFERclipregXGATED.clip import _transform as reg_gated_transform
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 
-try:
-    from safetensors.torch import load_file as load_safetensors
-except ImportError:
-    raise ImportError("safetensors 라이브러리가 필요합니다. `pip install safetensors`로 설치해주세요.")
-
-# --- 사용자 정의 모델 관련 임포트 관리 ---
-_USER_CUSTOM_CLIP_MODULES_LOADED = False
-_build_custom_vision_model_func = None
-_custom_image_transform_func = None
-
-def _ensure_user_custom_clip_modules_loaded():
-    global _USER_CUSTOM_CLIP_MODULES_LOADED, _build_custom_vision_model_func, _custom_image_transform_func
-    if _USER_CUSTOM_CLIP_MODULES_LOADED:
-        return
-
-    try:
-        # 이 파일(clip_encoder.py)은 LLaVA 프로젝트 내의 llava/model/multimodal_encoder/ 에 위치.
-        # LLaVA 프로젝트 루트는 이 파일 위치에서 세 단계 상위 디렉토리.
-        llava_project_root = Path(__file__).resolve().parents[3]
-        inferclipregxgated_module_path = llava_project_root / "INFERclipregXGATED"
-
-        if not inferclipregxgated_module_path.is_dir():
-            # 개발/테스트 환경 등에서 LLaVA 프로젝트 루트가 sys.path에 직접 추가된 경우를 대비
-            # 또는 INFERclipregXGATED가 PYTHONPATH 등을 통해 접근 가능한 경우
-            print(f"정보: {inferclipregxgated_module_path} 에서 INFERclipregXGATED 디렉토리를 찾을 수 없습니다. sys.path에서 직접 임포트를 시도합니다.")
-            # 이 경우, 사용자는 INFERclipregXGATED가 Python의 import 경로에 있도록 환경을 설정해야 함.
-            from INFERclipregXGATED.model import build_model as bm
-            from INFERclipregXGATED.clip import _transform as ct
-            print("sys.path에서 INFERclipregXGATED 모듈을 성공적으로 임포트했습니다.")
-        else:
-            # LLaVA 프로젝트 루트를 sys.path에 추가하여 INFERclipregXGATED 모듈을 임포트
-            if str(llava_project_root) not in sys.path:
-                sys.path.insert(0, str(llava_project_root))
-            from INFERclipregXGATED.model import build_model as bm
-            from INFERclipregXGATED.clip import _transform as ct
-            print(f"{inferclipregxgated_module_path} 에서 INFERclipregXGATED 모듈을 성공적으로 임포트했습니다.")
-
-        _build_custom_vision_model_func = bm
-        _custom_image_transform_func = ct
-        _USER_CUSTOM_CLIP_MODULES_LOADED = True
-
-    except ImportError as e:
-        print(f"치명적 오류: 사용자 정의 Reg-Gated CLIP 모듈(INFERclipregXGATED)을 임포트할 수 없습니다: {e}")
-        print("다음 사항을 확인하세요:")
-        print(f"1. LLaVA 프로젝트 루트 디렉토리 내에 'INFERclipregXGATED' 폴더가 올바르게 복사되었는지 확인 (현재 예상 경로: {llava_project_root / 'INFERclipregXGATED'})")
-        print("2. 'INFERclipregXGATED' 폴더 내에 '__init__.py', 'model.py', 'clip.py' 파일들이 존재하는지 확인")
-        print("3. 필요한 의존성 라이브러리가 모두 설치되었는지 확인")
-        raise
-
 
 class CLIPVisionTower(nn.Module):
-    def __init__(self, vision_tower_path_or_name, args, delay_load=False):
+    def __init__(self, vision_tower, args, delay_load=False):
         super().__init__()
+
         self.is_loaded = False
-        self.vision_tower_name = vision_tower_path_or_name
+        self.args = args # LlavaConfig 저장 (이것이 __init__에 전달된다고 가정)
+
+        self.vision_tower_name = vision_tower
+
+        self._num_registers = 0 # GATED 모델이 아니면 0, 또는 load_model에서 설정될 때까지 임시값
+        self._actual_patch_size = 14 # 기본값, load_model에서 실제 값으로 업데이트
+        self._input_resolution = 224 # 기본값, load_model에서 실제 값으로 업데이트
+
         self.select_layer = args.mm_vision_select_layer
         self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
-        self.args = args
-        self.num_registers = 0 # <-- 추가: 초기화
-
-        self.is_custom_reg_gated_clip = False
-        if isinstance(vision_tower_path_or_name, str) and \
-           ("reg-gated" in vision_tower_path_or_name.lower() or "reg_gated" in vision_tower_path_or_name.lower() or \
-            vision_tower_path_or_name.endswith("REG-GATED-balanced-ckpt12.safetensors")): # 파일 이름으로도 식별
-            if not os.path.isfile(vision_tower_path_or_name):
-                raise FileNotFoundError(
-                    f"Reg-Gated CLIP 모델로 인식되었으나, 제공된 경로가 실제 파일이 아닙니다: {vision_tower_path_or_name}. "
-                    f"--vision_tower 인자에는 Reg-Gated CLIP 체크포인트(.safetensors) 파일의 전체 절대 경로를 제공해야 합니다."
-                )
-            self.is_custom_reg_gated_clip = True
-            self.custom_model_ckpt_path = vision_tower_path_or_name
-            _ensure_user_custom_clip_modules_loaded() # 사용자 모듈 로드 보장
-
-        self.vision_tower = None # 실제 모델 파라미터
-        self.image_processor = None # 이미지 전처리기
+        self._device = None
 
         if not delay_load:
-            self.load_model(device_map=getattr(args, 'device_map', None))
+            self.load_model()
         elif getattr(args, 'unfreeze_mm_vision_tower', False):
-            self.load_model(device_map=getattr(args, 'device_map', None))
-        else:
-            self._load_config_only()
+            self.load_model()
 
-    def _load_config_only(self):
-        if not self.is_custom_reg_gated_clip:
-            self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
+        # CUSTOM: "GATED" 로컬 모델이고 delay_load=True 인 경우,
+        # CLIPVisionConfig.from_pretrained() 호출을 피하고,
+        # 나중에 load_model()에서 실제 모델 로드 후 config를 설정합니다.
+        elif "GATED" in self.vision_tower_name.upper():
+            # 이 경우, cfg_only는 None으로 두거나, 최소한의 기본값으로 설정할 수 있습니다.
+            # self.hidden_size 같은 속성은 load_model()이 호출된 후에야 정확해집니다.
+            self.cfg_only = None # 또는 기본 CLIPVisionConfig() 인스턴스
+
         else:
-            class MockRegGatedCLIPConfig:
-                hidden_size = 1024
-                image_size = 224 # 임시 값
-                patch_size = 14  # 임시 값
-                num_registers = 4 # <-- 추가: 기본값 설정
-            self.cfg_only = MockRegGatedCLIPConfig()
-            self.num_registers = self.cfg_only.num_registers # <-- 추가: 초기값 설정
+            self.cfg_only = CLIPVisionConfig.from_pretrained(self.vision_tower_name)
 
     def load_model(self, device_map=None):
-        """
-        비전 타워 파라미터와 이미지 전처리기를 메모리에 로드합니다.
-        - fp16 / bf16 / device_map 등이 args에 없더라도 기본값을 사용해
-          AttributeError가 발생하지 않도록 처리했습니다.
-        """
         if self.is_loaded:
-            print(f'{self.vision_tower_name} is already loaded, `load_model` called again, skipping.')
+            print(f'{self.vision_tower_name} is already loaded, skipping.')
             return
 
-        # ⬇️ 안전한 dtype 결정
-        fp16_flag = getattr(self.args, 'fp16', False)
-        bf16_flag = getattr(self.args, 'bf16', False)
-        target_dtype = torch.float16 if fp16_flag else (torch.bfloat16 if bf16_flag else torch.float32)
-        print(f"CLIPVisionTower 로드 시 사용할 target_dtype: {target_dtype} (fp16: {fp16_flag}, bf16: {bf16_flag})")
+        # "GATED" 모델 이름 감지 → Reg-Gated CLIP 로드 분기
+        if isinstance(self.vision_tower_name, str) and "GATED" in self.vision_tower_name.upper():
+            # 1) checkpoint 읽어 build_model 호출
 
-        # ----- (1) Reg‑Gated CLIP 로드 -----
-        if self.is_custom_reg_gated_clip:
-            print(f"로딩 시작: 사용자 정의 Reg-Gated CLIP 모델 ({self.custom_model_ckpt_path})")
-            _ensure_user_custom_clip_modules_loaded()
-
-            full_clip_model = _build_custom_vision_model_func(load_safetensors(self.custom_model_ckpt_path))
-            # build_model이 반환한 CLIP 모델에서 visual 속성 접근
-            loaded_vision_tower = full_clip_model.visual.to(dtype=target_dtype)
-
-            # --- 실제 num_registers 값 저장 ---
-            self.num_registers = getattr(loaded_vision_tower, 'num_registers', 4) # 로드된 모델에서 값 가져오기
-            print(f"  > Custom Reg-Gated CLIP loaded with num_registers: {self.num_registers}")
-
-            # LayerNorm float32 유지 (선택적)
-            # for m in loaded_vision_tower.modules():
-            #     if isinstance(m, nn.LayerNorm): m.float()
-
-            self.vision_tower = loaded_vision_tower
-            input_resolution = getattr(self.vision_tower, 'input_resolution', 224) # 로드된 모델에서 값 가져오기
-            self.actual_patch_size = getattr(self.vision_tower, 'patch_size', 14) # 로드된 모델에서 값 가져오기
-
-            # 전처리기 구성
-            class _CustomRegGatedCLIPImageProcessor:
-                def __init__(self, transform_fn, resolution, model_args):
-                    self.transform_fn = transform_fn
-                    self.crop_size    = {'height': resolution, 'width': resolution}
-                    self.size         = {'shortest_edge': resolution}
-                    self.image_mean   = getattr(model_args, 'image_mean', [0.48145466, 0.4578275, 0.40821073])
-                    self.image_std    = getattr(model_args, 'image_std',  [0.26862954, 0.26130258, 0.27577711])
-
-                def preprocess(self, images, return_tensors='pt'):
-                    img_list = images if isinstance(images, list) else [images]
-                    tensors  = [self.transform_fn(img.convert('RGB')) for img in img_list]
-                    if return_tensors == 'pt':
-                        return {'pixel_values': torch.stack(tensors)}
-                    raise ValueError(f"Unsupported return_tensors type: {return_tensors}")
-
-            self.image_processor = _CustomRegGatedCLIPImageProcessor(
-                _custom_image_transform_func(input_resolution),
-                input_resolution,
-                self.args
-            )
-
-            # cfg_only(모델 메타) 보정
-            if hasattr(self, 'cfg_only') and not isinstance(self.cfg_only, CLIPVisionConfig):
-                print("  > Updating MockConfig with actual values...")
-                self.cfg_only.image_size   = input_resolution
-                self.cfg_only.patch_size   = self.actual_patch_size
-                self.cfg_only.hidden_size  = 1024 # ViT-L 기준 고정값
-                self.cfg_only.num_registers = self.num_registers # <-- 추가: 실제 값으로 업데이트
-                print(f"  > MockConfig updated: image_size={self.cfg_only.image_size}, patch_size={self.cfg_only.patch_size}, num_registers={self.cfg_only.num_registers}")
-
-            print(f"사용자 정의 Reg‑Gated CLIP 모델 로드 완료.")
-
-        # ----- (2) 표준 HuggingFace CLIP 로드 -----
-        else:
-            self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-            self.vision_tower    = CLIPVisionModel.from_pretrained(
-                self.vision_tower_name,
-                torch_dtype=target_dtype,
-                device_map=device_map
-            )
-            self.actual_patch_size = self.vision_tower.config.patch_size
-            self.num_registers = 0 # 표준 CLIP은 레지스터 없음
+            vision_tower_path = self.vision_tower_name
+            # model_dir_for_vision_tower는 LlavaConfig (self.args)에 저장되어 있다고 가정
+            if not os.path.isabs(vision_tower_path) and hasattr(self.args, 'model_dir_for_vision_tower') and self.args.model_dir_for_vision_tower is not None:
+                vision_tower_path = os.path.join(self.args.model_dir_for_vision_tower, self.vision_tower_name)
             
-            # 파라미터 고정 및 로드 완료 플래그 설정 (기존 코드 유지)
-            self.vision_tower.requires_grad_(getattr(self.args, 'unfreeze_mm_vision_tower', False)) # unfreeze 옵션 반영
+            if not os.path.exists(vision_tower_path):
+                raise FileNotFoundError(f"Custom vision tower GATED file not found at {vision_tower_path}. Original name: {self.vision_tower_name}, Model dir: {getattr(self.args, 'model_dir_for_vision_tower', 'Not Set')}")
+            state = load_safetensors(self.vision_tower_name)
+
+
+            # 2) visual encoder만 뽑아서 dtype/device 설정
+            target_dtype = self.dtype
+            # build_reg_gated_clip 호출 시 target_dtype 전달
+            full_clip = build_reg_gated_clip(state, model_dtype=target_dtype)
+
+            # device_map 처리: "auto"인 경우 실제 장치로 변환
+            resolved_device = device_map
+            if device_map == "auto":
+                # "auto"는 여기서 직접 사용할 수 없으므로, 주 장치를 선택하거나 CPU를 사용
+                resolved_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            elif device_map is None: # device_map이 명시적으로 None이면 기본 CUDA 사용
+                resolved_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            self._device = resolved_device # 결정된 device를 인스턴스 변수에 저장!
+
+            self.vision_tower = full_clip.visual.to(device=self._device, dtype=target_dtype)
+            self.vision_tower.requires_grad_(False)
+
+            # 3) 등록 토큰 수, 해상도, 패치크기 얻기
+            self._num_registers = getattr(self.vision_tower, 'num_registers', 4) # GATED 모델의 num_registers 속성 사용
+            self._input_resolution = getattr(self.vision_tower, 'input_resolution', 224)
+            self._actual_patch_size = getattr(self.vision_tower, 'patch_size', 14)
+
+            # 모델 로드 후, config 객체를 실제 모델의 config로 설정
+            # VisionTransformer에 self.width가 직접 없으므로, conv1.out_channels 등에서 가져옴
+            # 또는 class_embedding.shape[-1], positional_embedding.shape[-1] 등도 가능
+            vision_tower_width = self.vision_tower.conv1.out_channels
+            self.vision_tower.config = self._build_dummy_config_for_gated(
+                vision_tower_width,
+                self._input_resolution,
+                self._actual_patch_size
+                )
+
+            # 4) 전처리기 설정
+            self.image_processor = reg_gated_transform(self._input_resolution)
+
+            # CUSTOM: Compose 객체에 image_mean, image_std 속성 추가
+            # 이 값들은 reg_gated_transform 내부의 Normalize에 사용된 값이어야 함.
+            # 일반적으로 CLIP 표준 값을 사용하거나, 모델 학습 시 사용된 특정 값을 사용.
+            # 예시로 CLIP 표준 값을 사용. 실제 값으로 변경 필요.
+            setattr(self.image_processor, 'image_mean', getattr(self.args, 'custom_image_mean', [0.48145466, 0.4578275, 0.40821073]))
+            setattr(self.image_processor, 'image_std', getattr(self.args, 'custom_image_std', [0.26862954, 0.26130258, 0.27577711]))
+            setattr(self.image_processor, 'crop_size', {'height': self._input_resolution, 'width': self._input_resolution})
+            setattr(self.image_processor, 'size', {'shortest_edge': self._input_resolution})
+
             self.is_loaded = True
+            return
 
-            print(f"표준 CLIP 모델 ({self.vision_tower_name}) 로드 완료.")
-
-            if hasattr(self, 'cfg_only') and not isinstance(self.cfg_only, CLIPVisionConfig):
-                self.cfg_only = self.vision_tower.config
-
-        # 파라미터 고정
+        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
+        # 표준 모델 로드 시에도 self.dtype을 존중하도록 torch_dtype 인자 전달
+        self.vision_tower = CLIPVisionModel.from_pretrained(
+            self.vision_tower_name,
+            device_map=device_map,
+            torch_dtype=target_dtype)
         self.vision_tower.requires_grad_(False)
+
+        # HF 모델의 경우, 첫 번째 파라미터의 device를 self._device로 설정
+        if len(list(self.vision_tower.parameters())) > 0:
+            self._device = next(self.vision_tower.parameters()).device
+        elif device_map == "auto": # 파라미터가 없지만 auto인 경우 (매우 드문 케이스)
+                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device_map, str): # "cuda:0" 등 명시적 장치 문자열
+                self._device = torch.device(device_map)
+        else: # 기타 (None 등)
+                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.is_loaded = True
 
+    def _build_dummy_config_for_gated(self, hidden_size, image_size, patch_size):
+        """GATED 모델 로드 후, 호환성을 위해 최소한의 config 객체를 생성합니다."""
+        # CLIPVisionConfig의 필수 필드들을 채워줍니다.
+        # 실제 CLIPVisionConfig 인스턴스를 생성하고 값을 할당하는 것이 좋습니다.
+        config = CLIPVisionConfig(
+            hidden_size=hidden_size,
+            image_size=image_size,
+            patch_size=patch_size,
+            # projection_dim 등 다른 필요한 기본값들을 추가할 수 있습니다.
+        )
+        return config
 
     def feature_select(self, image_forward_outs):
         image_features = image_forward_outs.hidden_states[self.select_layer]
@@ -207,282 +153,256 @@ class CLIPVisionTower(nn.Module):
         return image_features
 
     @torch.no_grad()
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor, output_attentions_for_visualization: bool = False):
+        """
+        Forward pass for CLIPVisionTower.
+        Args:
+            images: Input image tensor(s). Expected to be a batch tensor for attention viz.
+            output_attentions_for_visualization: If True, return attention weights.
+        Returns:
+            Image features, or (Image features, Vision tower attentions) if requested.
+        """
         if not self.is_loaded:
-            device_map = getattr(
-                self.args, 'device_map',
-                {"": torch.cuda.current_device() if torch.cuda.is_available() else "cpu"}
-            )
-            self.load_model(device_map=device_map)
+            self.load_model()
+            if not self.is_loaded:
+                raise RuntimeError(f"Vision tower {self.vision_tower_name} not loaded.")
 
-        # dtype / device 동기화
-        if self.vision_tower is None:
-            raise RuntimeError("Vision tower is not loaded. Call load_model() first.")
-        try:
-            vision_params = list(self.vision_tower.parameters())
-            if not vision_params:
-                # 비전 타워에 파라미터가 없는 경우 (예: nn.Identity를 래핑한 경우 등)
-                # 또는 로드가 완전히 실패한 경우.
-                # args에서 device/dtype을 가져오려는 시도는 할 수 있으나, 모델 자체의 특성을 반영 못함.
-                # 이 경우는 로드 로직에서 더 강력한 검증이 필요할 수 있음.
-                print("Warning: Vision tower has no parameters. Device/dtype determination might be unreliable.")
-                # 임시로 args를 사용하거나, 에러 발생시키는 것이 더 안전할 수 있음.
-                # 여기서는 이전 로직을 유지하되, 경고를 명확히 함.
-                if hasattr(self.args, 'device'): tgt_dev = self.args.device
-                else: tgt_dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        target_device = self.device
+        target_dtype = self.dtype
 
-                if getattr(self.args, 'bf16', False): tgt_dtype = torch.bfloat16
-                elif getattr(self.args, 'fp16', False): tgt_dtype = torch.float16
-                else: tgt_dtype = torch.float32
+        # Assuming 'images' is a pre-processed batch tensor as is typical from the main script.
+        # Handling for list of PIL images is omitted for brevity here, as the main script
+        # usually provides a batch tensor.
+        if not isinstance(images, torch.Tensor):
+            # Fallback or error if `images` is not a tensor.
+            # This path should ideally not be taken if `llava_run_inference.py` prepares `img_tensor` correctly.
+            raise ValueError("`images` argument in CLIPVisionTower.forward must be a tensor.")
+
+        images_batch = images.to(device=target_device, dtype=target_dtype)
+        
+        # Call the internal vision model (self.vision_tower)
+        # self.vision_tower is an instance of VisionTransformer (custom) or CLIPVisionModel (HF)
+        # Both should accept output_attentions and return an object with an .attentions attribute.
+        vision_model_output = self.vision_tower(
+            images_batch,
+            output_hidden_states=True, # Required for self.feature_select
+            output_attentions=output_attentions_for_visualization
+        )
+        
+        # Extract features using the existing feature_select method
+        final_image_features = self.feature_select(vision_model_output).to(target_dtype)
+        
+        final_attentions = None
+        if output_attentions_for_visualization:
+            # vision_model_output is expected to have an 'attentions' attribute
+            # which is a tuple of tensors (one for each layer of the vision model)
+            if hasattr(vision_model_output, 'attentions'):
+                final_attentions = vision_model_output.attentions
             else:
-                tgt_dev = vision_params[0].device
-                tgt_dtype = vision_params[0].dtype
-        except StopIteration: # next(self.vision_tower.parameters()) 실패 시
-            print("Warning: Could not determine vision tower device/dtype from parameters. Using model's main device/dtype.")
-            if hasattr(self.args, 'device'): tgt_dev = self.args.device
-            else: tgt_dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-            if getattr(self.args, 'bf16', False): tgt_dtype = torch.bfloat16
-            elif getattr(self.args, 'fp16', False): tgt_dtype = torch.float16
-            else: tgt_dtype = torch.float32
+                # This case should not happen if VisionTransformer.forward is correctly modified
+                print(f"Warning: Vision model output for {self.vision_tower_name} "
+                      "did not have 'attentions' attribute when requested.")
 
-        images = images.to(device=tgt_dev, dtype=tgt_dtype)
-        image_features_selected_layer = None # 초기화
-
-        # ───────────────────── Reg‑Gated CLIP 분기 ─────────────────────
-        if self.is_custom_reg_gated_clip:
-            # --- 커스텀 VisionTransformer 호출 시 output_hidden_states=True 전달 ---
-            print(f"Debug (Custom CLIP forward): Calling vision_tower with output_hidden_states=True. select_layer: {self.select_layer}")
-            outputs = self.vision_tower(images, output_hidden_states=True)
-
-            hidden_states_tuple = None
-            if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None and len(outputs.hidden_states) > 0:
-                hidden_states_tuple = outputs.hidden_states
-                print(f"  > Received hidden_states_tuple with {len(hidden_states_tuple)} layers.")
-            else:
-                print(f"  > Warning: hidden_states_tuple not found or empty in vision tower output. Defaulting to last_hidden_state.")
-
-            # --- select_layer 적용 ---
-            # hidden_states_tuple이 있고, self.select_layer가 유효한 경우에만 사용
-            # (HF 모델은 select_layer=0이 임베딩, 1부터 트랜스포머 레이어)
-            # 커스텀 모델은 hidden_states[0]이 ln_pre 후, hidden_states[1]부터가 트랜스포머 레이어 1의 출력.
-            # LLaVA의 select_layer: 음수는 끝에서부터 (예: -1은 마지막, -2는 마지막에서 두번째)
-            # 양수는 0부터 시작.
-            if hidden_states_tuple is not None:
-                num_hidden_layers = len(hidden_states_tuple)
-                target_layer_index = self.select_layer
-                # 음수 인덱스를 양수 인덱스로 변환
-                if target_layer_index < 0:
-                    target_layer_index = num_hidden_layers + target_layer_index # 예: -1 -> len-1, -2 -> len-2
-
-                if 0 <= target_layer_index < num_hidden_layers:
-                    image_features_full = hidden_states_tuple[target_layer_index]
-                    print(f"  > Selected layer {self.select_layer} (index {target_layer_index}) from hidden_states. Shape: {image_features_full.shape}")
-                else:
-                    print(f"  > Warning: Invalid select_layer index {target_layer_index} (original: {self.select_layer}) for {num_hidden_layers} hidden layers. Defaulting to last_hidden_state.")
-                    image_features_full = outputs.last_hidden_state # 폴백
-            else: # hidden_states_tuple이 없는 경우 (커스텀 모델이 지원 안 하거나, output_hidden_states=False로 호출된 경우)
-                image_features_full = outputs.last_hidden_state # 폴백
-                print(f"  > Using last_hidden_state as image_features_full. Shape: {image_features_full.shape}")
-
-            # --- image_features_full 유효성 검사 (폴백 후에도 None일 수 있으므로) ---
-            if image_features_full is None:
-                if hasattr(outputs, 'last_hidden_state') and outputs.last_hidden_state is not None:
-                    image_features_full = outputs.last_hidden_state
-                    print("  > Warning: image_features_full was None, re-defaulted to last_hidden_state.")
-                else:
-                    print("Error: image_features_full is None even after trying last_hidden_state. Vision tower output is problematic.")
-                    return self.dummy_feature.to(images.dtype) # dummy_feature 반환
-
-            # --- 특징 선택 로직 (mm_vision_select_feature 적용) ---
-            B, S, H = image_features_full.shape
-            cfg = self.config
-            if cfg.patch_size is None or cfg.patch_size == 0:
-                raise ValueError("Patch size is not configured correctly in CLIPVisionTower.config.")
-            num_patches = (cfg.image_size // cfg.patch_size) ** 2
-
-            # 시퀀스 길이 계산 시점: image_features_full은 (CLS + REG + Patch) 전체 시퀀스
-            expected_seq_len = 1 + self.num_registers + num_patches
-            current_seq_len = image_features_full.shape[1]
-
-            if current_seq_len != expected_seq_len:
-                print(f"Error (Custom CLIP forward): Unexpected sequence length from selected layer! Expected {expected_seq_len} (1 CLS + {self.num_registers} REG + {num_patches} Patch for image_size {cfg.image_size}), but got {current_seq_len}. Check VisionTransformer's hidden_states output and config.")
-                return self.dummy_feature.to(images.dtype)
-
-            print(f"  > (After layer selection) Selecting feature '{self.select_feature}'. Num registers: {self.num_registers}, Num patches: {num_patches}")
-
-            if self.select_feature == 'patch':
-                start_index = 1 + self.num_registers
-                end_index = start_index + num_patches
-                image_features_selected_layer = image_features_full[:, start_index:end_index]
-                print(f"    > Sliced for 'patch': start={start_index}, end={end_index}. Final shape: {image_features_selected_layer.shape}")
-            elif self.select_feature == 'cls_patch':
-                end_index = 1 + self.num_registers + num_patches
-                image_features_selected_layer = image_features_full[:, 0:end_index]
-                print(f"    > Sliced for 'cls_patch': start=0, end={end_index}. Final shape: {image_features_selected_layer.shape}")
-            else:
-                print(f"    > Warning: Unknown select_feature '{self.select_feature}'. Defaulting to 'patch'.")
-                start_index = 1 + self.num_registers
-                end_index = start_index + num_patches
-                image_features_selected_layer = image_features_full[:, start_index:end_index]
-                print(f"    > Sliced for 'patch' (default): start={start_index}, end={end_index}. Final shape: {image_features_selected_layer.shape}")
-
-        # ─────────────────── 표준 Hugging‑Face CLIP 분기 ──────────────────
-        else: # is_custom_reg_gated_clip == False
-            # 표준 CLIP 경로는 이미 output_hidden_states=True로 호출하고, self.feature_select 내부에서 self.select_layer 사용
-            print(f"Debug (Standard CLIP forward): Calling vision_tower with output_hidden_states=True.")
-            outs = self.vision_tower(images, output_hidden_states=True)
-            # self.feature_select는 hidden_states[self.select_layer] 를 사용하고, 그 다음 'patch'/'cls_patch' 슬라이싱
-            image_features_selected_layer = self.feature_select(outs)
-            print(f"  > Selected features using select_layer={self.select_layer}, select_feature='{self.select_feature}'. Final shape: {image_features_selected_layer.shape}")
-
-
-        # --- 최종 반환 전 null 체크 및 타입 변환 ---
-        if image_features_selected_layer is None:
-            print("Error: image_features_selected_layer is None before returning from CLIPVisionTower.forward.")
-            return self.dummy_feature.to(images.dtype)
-
-        return image_features_selected_layer.to(images.dtype)
-
-    # --- config 속성 수정 ---
-    @property
-    def config(self):
-        if self.is_loaded:
-            if self.is_custom_reg_gated_clip:
-                # MockConfig 업데이트 (load_model에서 설정된 실제 값 사용)
-                class MockConfig:
-                    # --- 값 가져오기 전에 self.vision_tower 존재 확인 ---
-                    if self.vision_tower is None:
-                        # 로드는 되었으나 vision_tower가 None인 비정상 상태
-                        # _load_config_only에서 설정된 임시값 사용
-                        hidden_size = self.cfg_only.hidden_size if hasattr(self, 'cfg_only') else 1024
-                        image_size = self.cfg_only.image_size if hasattr(self, 'cfg_only') else 224
-                        patch_size = self.cfg_only.patch_size if hasattr(self, 'cfg_only') else 14
-                    else:
-                        # 로드된 실제 모델 값 사용
-                        hidden_size = getattr(self.vision_tower, 'width', 1024) # width 속성 가정
-                        image_size = getattr(self.vision_tower, 'input_resolution', 224)
-                        patch_size = getattr(self.vision_tower, 'patch_size', 14)
-
-                    num_registers = self.num_registers # load_model에서 설정된 값
-                return MockConfig()
-            else:
-                # 표준 CLIP: HF config 반환
-                if self.vision_tower is None: # 로드 실패/지연 시
-                    return self.cfg_only
-                return self.vision_tower.config
+        if output_attentions_for_visualization:
+            return final_image_features, final_attentions
         else:
-            # delay_load=True이고 아직 load_model이 호출되지 않았을 때 사용
-            # _load_config_only에서 설정된 cfg_only 반환
-            if not hasattr(self, 'cfg_only'): # 예외 처리
-                self._load_config_only() # 시도
-            return self.cfg_only
+            return final_image_features
 
-    # --- num_patches 속성 수정 ---
-    @property
-    def num_patches(self):
-        config_obj = self.config
-        # --- config 객체 및 속성 유효성 검사 강화 ---
-        img_size = getattr(config_obj, 'image_size', None)
-        patch_size = getattr(config_obj, 'patch_size', None)
-
-        if img_size is not None and patch_size is not None and isinstance(img_size, int) and isinstance(patch_size, int) and patch_size > 0:
-            num_patches_val = (img_size // patch_size) ** 2
-            # print(f"Debug: Calculated num_patches = {num_patches_val} (image_size={img_size}, patch_size={patch_size})")
-            return num_patches_val
-        else:
-            print(f"Warning: num_patches calculation failed. image_size={img_size}, patch_size={patch_size}. Returning default.")
-            # L/14 기본값
-            return (224 // 14) ** 2
-
-    # --- dummy_feature 속성 추가 (에러 처리용) ---
     @property
     def dummy_feature(self):
-        # num_patches와 hidden_size 계산 시도
-        try:
-            num_patches = self.num_patches
-            hidden_size = self.hidden_size
-        except Exception as e:
-            print(f"Warning: Could not get num_patches/hidden_size for dummy_feature: {e}. Using defaults.")
-            num_patches = 256 # L/14 default
-            hidden_size = 1024 # L/14 default
+        return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)
 
-        # device와 dtype 결정 시도
-        try:
-            dev = self.device
-            dt = self.dtype
-        except Exception as e:
-            print(f"Warning: Could not get device/dtype for dummy_feature: {e}. Using defaults.")
-            dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dt = torch.float16 # Default dtype
+    # @property
+    # def dtype(self):
+    #     if self.vision_tower is not None and hasattr(self.vision_tower, 'dtype'): # 실제 모델의 dtype 우선
+    #         return self.vision_tower.dtype
+    #     # self.args (LlavaConfig) 기반 dtype 결정 로직 (이전과 동일)
+    #     if hasattr(self.args, 'torch_dtype') and self.args.torch_dtype is not None:
+    #         return self.args.torch_dtype
+    #     elif getattr(self.args, 'fp16', False):
+    #         return torch.float16
+    #     elif getattr(self.args, 'bf16', False):
+    #         return torch.bfloat16
+    #     return torch.float32
 
-        # print(f"Debug: Creating dummy_feature with shape (1, {num_patches}, {hidden_size}) on {dev} with {dt}")
-        return torch.zeros(1, num_patches, hidden_size, device=dev, dtype=dt)
 
-    # --- hidden_size 속성 추가 (일관성) ---
     @property
-    def hidden_size(self):
-        return getattr(self.config, 'hidden_size', 1024) # 기본값 ViT-L 기준
-
-    # --- device, dtype 속성에서 None 체크 추가 ---
-    @property
-    def dtype(self):
-        if self.vision_tower is not None and hasattr(self.vision_tower, 'dtype') and self.vision_tower.dtype is not None:
+    def dtype(self) -> torch.dtype:
+        # 1. 모델이 이미 로드되었고, 실제 vision_tower 모듈에 dtype 속성이 있다면 그것을 사용
+        if self.is_loaded and self.vision_tower is not None and hasattr(self.vision_tower, 'dtype'):
             return self.vision_tower.dtype
-        # Fallback logic (기존과 유사)
-        if getattr(self.args, 'bf16', False): return torch.bfloat16
-        if getattr(self.args, 'fp16', False): return torch.float16
-        return torch.float32 # 최종 기본값
+        
+        # 2. self.args (LlavaConfig 인스턴스)가 설정되어 있는지 확인
+        if not hasattr(self, 'args') or self.args is None:
+            warnings.warn(
+                "CLIPVisionTower.args (LlavaConfig) is not set. "
+                "Defaulting dtype to torch.bfloat16 based on user preference. "
+                "This might be unintended if args were expected to provide dtype info."
+            )
+            return torch.bfloat16 # 사용자가 bf16을 원하므로, 비상시 기본값으로 bf16
+
+        # 3. LlavaConfig에 저장된 torch_dtype 객체를 직접 사용 (가장 우선)
+        #    LlavaConfig.__init__에서 self.torch_dtype에 실제 torch.dtype 객체를 저장했다고 가정
+        if hasattr(self.args, 'torch_dtype') and isinstance(self.args.torch_dtype, torch.dtype):
+            return self.args.torch_dtype
+        
+        # 4. LlavaConfig에 torch_dtype이 문자열로 저장된 경우 처리 (예: "bfloat16")
+        #    (LlavaConfig.__init__에서 self.torch_dtype에 문자열을 저장했을 경우)
+        if hasattr(self.args, 'torch_dtype') and isinstance(self.args.torch_dtype, str):
+            dtype_str = self.args.torch_dtype.lower()
+            if dtype_str == "bfloat16":
+                return torch.bfloat16
+            elif dtype_str == "float16":
+                return torch.float16
+            elif dtype_str == "float32":
+                return torch.float32
+            else:
+                warnings.warn(f"Unsupported torch_dtype string '{self.args.torch_dtype}' in LlavaConfig. Defaulting to bfloat16.")
+                return torch.bfloat16 # 알 수 없는 문자열이면 bf16으로
+
+        # 5. LlavaConfig의 bf16 또는 fp16 플래그를 확인 (torch_dtype 속성이 없는 경우의 fallback)
+        #    bf16을 우선적으로 확인
+        if getattr(self.args, 'bf16', False):
+            return torch.bfloat16
+        elif getattr(self.args, 'fp16', False):
+            return torch.float16
+        
+        # 6. 모든 조건에 해당하지 않으면, 사용자가 bf16을 원한다고 했으므로 bfloat16 반환
+        #    또는 LlamaConfig의 기본 dtype을 따르도록 torch.float32를 반환할 수도 있음
+        #    여기서는 사용자 요청에 따라 bf16
+        return torch.bfloat16
+
+    @property
+    def num_registers(self):
+        # load_model에서 설정된 _num_registers 값을 반환
+        # 또는 GATED 모델의 경우 여기서 하드코딩된 값을 반환할 수도 있음
+        if "GATED" in self.vision_tower_name.upper():
+            return self._num_registers # load_model에서 설정된 값을 따름 (또는 여기서 4로 고정해도 됨)
+        # 표준 HF CLIP 모델은 num_registers가 없으므로 0 반환
+        return 0
 
     @property
     def device(self):
-        if self.vision_tower is not None:
-            try:
-                # 파라미터 리스트에서 디바이스 가져오기
-                return next(self.vision_tower.parameters()).device
-            except StopIteration:
-                # 파라미터 없는 모듈 (예: Identity)
-                pass
-            # .device 속성이 직접 있는지 확인
-            if hasattr(self.vision_tower, 'device') and self.vision_tower.device is not None:
-                return self.vision_tower.device
-        # Fallback logic
+        if self._device is not None:
+            return self._device
+        # fallback (load_model이 호출되지 않은 극단적인 경우)
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     @property
     def config(self):
-        # load_model이 호출된 후에는 실제 모델의 config (또는 mock config)를 사용
         if self.is_loaded:
-            if self.is_custom_reg_gated_clip:
-                # MockConfig 인스턴스 반환 (load_model에서 image_size, patch_size 업데이트됨)
-                # hidden_size는 고정
-                class MockConfig:
-                    hidden_size = 1024
-                    image_size = self.vision_tower.input_resolution
-                    patch_size = self.actual_patch_size
-                return MockConfig()
-            return self.vision_tower.config # HF CLIPVisionModel의 config
+            return self.vision_tower.config
         else:
-            # delay_load=True이고 아직 load_model이 호출되지 않았을 때 사용
             return self.cfg_only
 
     @property
     def hidden_size(self):
-        # mm_projector의 입력 차원. RegCLIP(proj=None)은 1024.
         return self.config.hidden_size
 
     @property
     def num_patches_per_side(self):
-        config_obj = self.config
-        if not hasattr(config_obj, 'image_size') or not hasattr(config_obj, 'patch_size') or \
-           config_obj.image_size is None or config_obj.patch_size is None:
-            # 모델 로드 전이거나 config에 해당 정보가 완전하지 않을 수 있음.
-            # 이 경우 기본값이나 에러를 발생시킬 수 있으나, 보통 LLaVA는 모델 로드 후 이 속성을 사용함.
-            # ViT-L/14 기본값으로 임시 반환 (실제 값은 load_model 후 config에 의해 결정)
-            print("경고: config에 image_size 또는 patch_size 정보가 불완전합니다. 기본값 사용.")
-            return 224 // 14 
-        return config_obj.image_size // config_obj.patch_size
+        """
+        Calculates the number of patches on one side of the square image.
+        This value depends on whether the model is loaded, and if it's a GATED model
+        or a standard Hugging Face CLIP model.
+        """
+        if self.is_loaded: # 모델이 로드된 후
+            if "GATED" in self.vision_tower_name.upper():
+                # GATED 모델: load_model에서 설정된 내부 변수 사용
+                # self._input_resolution과 self._actual_patch_size는 load_model에서 설정됨
+                if self._actual_patch_size == 0: # 패치 크기가 0이면 나눗셈 오류 방지
+                    return 0 
+                return self._input_resolution // self._actual_patch_size
+            else: # 표준 HF CLIP 모델: 로드된 모델의 config 사용
+                if self.vision_tower is not None and hasattr(self.vision_tower, 'config'):
+                    config = self.vision_tower.config
+                    if config.patch_size == 0: return 0
+                    return config.image_size // config.patch_size
+                else: # 로드는 되었으나 config 접근 불가 (예외적 상황)
+                    warnings.warn("Vision tower loaded but config not accessible, falling back to LlavaConfig for patch info.")
+                    # LlavaConfig의 기본값이나 사용자 설정값으로 fallback
+                    image_size = getattr(self.args, 'vision_image_size', 224) # LlavaConfig에 vision_image_size 추가 필요
+                    patch_size = getattr(self.args, 'vision_patch_size', 14) # LlavaConfig에 vision_patch_size 추가 필요
+                    if patch_size == 0: return 0
+                    return image_size // patch_size
+        else: # 모델이 로드되기 전 (delay_load=True 인 경우)
+            if "GATED" in self.vision_tower_name.upper():
+                # GATED 모델 로드 전: LlavaConfig의 기본값 또는 사용자 설정값 사용
+                # (이 값들은 GATED 모델의 실제 값과 일치해야 함)
+                image_size = getattr(self.args, 'vision_image_size', 224) # LlavaConfig에 vision_image_size 필드 추가 고려
+                patch_size = getattr(self.args, 'vision_patch_size', 14) # LlavaConfig에 vision_patch_size 필드 추가 고려
+                if patch_size == 0: return 0
+                return image_size // patch_size
+            elif self.cfg_only is not None: # 표준 HF CLIP 모델 로드 전 (cfg_only 사용)
+                if self.cfg_only.patch_size == 0: return 0
+                return self.cfg_only.image_size // self.cfg_only.patch_size
+            else: # cfg_only도 없는 경우 (예: GATED 모델이 아닌데 경로가 잘못된 경우 등)
+                warnings.warn("Cannot determine num_patches_per_side before model loading without cfg_only or GATED model hints.")
+                return 0 # 또는 적절한 기본값 (예: 224 // 14 = 16)
 
     @property
     def num_patches(self):
-        # 순수 패치 토큰의 수 (CLS 토큰 제외)
-        return self.num_patches_per_side ** 2
+        """
+        Calculates the total number of patches.
+        """
+        n_patches_side = self.num_patches_per_side
+        return n_patches_side * n_patches_side
+
+
+
+class CLIPVisionTowerS2(CLIPVisionTower):
+    def __init__(self, vision_tower, args, delay_load=False):
+        super().__init__(vision_tower, args, delay_load)
+
+        self.s2_scales = getattr(args, 's2_scales', '336,672,1008')
+        self.s2_scales = list(map(int, self.s2_scales.split(',')))
+        self.s2_scales.sort()
+        self.s2_split_size = self.s2_scales[0]
+        self.s2_image_size = self.s2_scales[-1]
+
+        try:
+            from s2wrapper import forward as multiscale_forward
+        except ImportError:
+            raise ImportError('Package s2wrapper not found! Please install by running: \npip install git+https://github.com/bfshi/scaling_on_scales.git')
+        self.multiscale_forward = multiscale_forward
+
+        # change resize/crop size in preprocessing to the largest image size in s2_scale
+        if not delay_load or getattr(args, 'unfreeze_mm_vision_tower', False):
+            self.image_processor.size['shortest_edge'] = self.s2_image_size
+            self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.s2_image_size
+
+    def load_model(self, device_map=None):
+        if self.is_loaded:
+            print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
+            return
+
+        self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
+        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        self.vision_tower.requires_grad_(False)
+
+        self.image_processor.size['shortest_edge'] = self.s2_image_size
+        self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.s2_image_size
+
+        self.is_loaded = True
+
+    @torch.no_grad()
+    def forward_feature(self, images):
+        image_forward_outs = self.vision_tower(images.to(device=self.device, dtype=self.dtype), output_hidden_states=True)
+        image_features = self.feature_select(image_forward_outs).to(images.dtype)
+        return image_features
+
+    @torch.no_grad()
+    def forward(self, images):
+        if type(images) is list:
+            image_features = []
+            for image in images:
+                image_feature = self.multiscale_forward(self.forward_feature, image.unsqueeze(0), img_sizes=self.s2_scales, max_split_size=self.s2_split_size)
+                image_features.append(image_feature)
+        else:
+            image_features = self.multiscale_forward(self.forward_feature, images, img_sizes=self.s2_scales, max_split_size=self.s2_split_size)
+
+        return image_features
+
+    @property
+    def hidden_size(self):
+        return self.config.hidden_size * len(self.s2_scales)

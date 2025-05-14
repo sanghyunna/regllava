@@ -49,6 +49,7 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -63,19 +64,88 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
-        attn_mask = None
-
+    # ResidualAttentionBlock.attention 메서드 수정
+    def attention(self, x: torch.Tensor, need_weights: bool = False):
+        """
+        Applies multi-head attention.
+        Args:
+            x (torch.Tensor): Input tensor.
+            need_weights (bool): If True, returns attention weights. Defaults to False.
+        Returns:
+            torch.Tensor or Tuple[torch.Tensor, torch.Tensor]:
+                If need_weights is False, returns attention output.
+                If need_weights is True, returns (attention_output, attention_weights).
+        """
+        attn_mask_internal = None
         if self.attn_mask is not None:
-            n_ctx = x.shape[0]
-            attn_mask = self.attn_mask[..., -n_ctx:, -n_ctx:].to(dtype=x.dtype, device=x.device)            
+            n_ctx = x.shape[0] # L
+            # Assuming self.attn_mask is (L_max, L_max) or compatible for slicing to (L, L)
+            attn_mask_internal = self.attn_mask[..., -n_ctx:, -n_ctx:].to(dtype=x.dtype, device=x.device)
+        
+        # self.attn is nn.MultiheadAttention.
+        # Returns attn_output, attn_output_weights if need_weights=True
+        # Else, only attn_output
+        return self.attn(x, x, x, need_weights=need_weights, attn_mask=attn_mask_internal)
 
-        return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
+    # ResidualAttentionBlock.forward 메서드 수정
+    def forward(self, x: torch.Tensor, output_attentions: bool = False):
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        # # 디버깅용 print (ResidualAttentionBlock.forward 내부, self.attention 호출 직후)
+        # temp_attention_output = self.attention(self.ln_1(x), need_weights=output_attentions)
+        # print(f"Type of temp_attention_output: {type(temp_attention_output)}")
+        # if isinstance(temp_attention_output, tuple):
+        #     print(f"  Length of tuple: {len(temp_attention_output)}")
+        #     for i, item in enumerate(temp_attention_output):
+        #         print(f"    Item {i} type: {type(item)}, shape: {item.shape if isinstance(item, torch.Tensor) else 'N/A'}")
+        # elif isinstance(temp_attention_output, torch.Tensor):
+        #     print(f"  Shape of tensor: {temp_attention_output.shape}")
+        # attention_mechanism_output = temp_attention_output # 원래 변수명으로 다시 할당
+        """
+        Forward pass for the ResidualAttentionBlock.
+        Args:
+            x (torch.Tensor): Input tensor.
+            output_attentions (bool): If True, returns attention weights along with the output.
+        Returns:
+            torch.Tensor or Tuple[torch.Tensor, torch.Tensor]:
+                If output_attentions is False, returns block output.
+                If output_attentions is True, returns (block_output, attention_weights).
+        """
+        # self.attention 메서드는 need_weights 값에 따라 반환 타입이 달라짐.
+        attention_mechanism_output = self.attention(self.ln_1(x), need_weights=output_attentions)
+        
+        attn_output_tensor = None  # 실제 어텐션 연산 결과 (텐서)
+        attn_weights_tensor = None # 어텐션 가중치 (텐서 또는 None)
+
+        if isinstance(attention_mechanism_output, tuple):
+            # self.attention이 튜플을 반환했다면, (output, weights) 순서로 가정
+            attn_output_tensor = attention_mechanism_output[0]
+            if output_attentions: # 실제로 어텐션 가중치가 요청된 경우에만 weights를 할당
+                attn_weights_tensor = attention_mechanism_output[1]
+            # else: output_attentions가 False인데 튜플이 반환된 비정상적인 경우,
+            #       attn_weights_tensor는 None으로 유지.
+            #       (이런 경우는 nn.MultiheadAttention 기본 동작에서는 발생하지 않아야 함)
+        else:
+            # self.attention이 단일 텐서를 반환했다면, 그것이 output임
+            attn_output_tensor = attention_mechanism_output
+            # attn_weights_tensor는 None으로 유지 (output_attentions가 False인 경우)
+
+        # 이제 attn_output_tensor는 항상 텐서여야 함. (None이 아니라고 가정)
+        if attn_output_tensor is None:
+            # 이 경우는 self.attention이 예상치 못하게 None을 반환했거나 로직 오류.
+            # 디버깅을 위해 오류를 발생시키거나 기본값을 설정할 수 있음.
+            # 여기서는 오류 발생 가능성을 명시적으로 알리는 것이 좋음.
+            raise ValueError("attn_output_tensor in ResidualAttentionBlock is None after attention call.")
+            
+        x = x + attn_output_tensor  # 잔차 연결
+        x = x + self.mlp(self.ln_2(x)) # MLP
+        
+        if output_attentions:
+            # attn_weights_tensor가 None이 아니어야 함 (output_attentions=True이면)
+            # 만약 self.attention이 튜플을 반환했으나 두번째 요소가 없거나 None이면 문제가 될 수 있음
+            # (nn.MultiheadAttention은 need_weights=True면 항상 두번째 요소로 weights를 반환)
+            return x, attn_weights_tensor
+        else:
+            return x
 
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
@@ -118,39 +188,57 @@ class VitTransformer(nn.Module):
         else:
             self.intermediate_fusion_mlps = None
 
-    def forward(self, x: torch.Tensor, output_hidden_states: bool = False):
-        # x shape: [seq_len, batch, width]
-        all_hidden_states = () if output_hidden_states else None # 중간 출력 저장용 튜플
+    def forward(self, x: torch.Tensor, output_hidden_states: bool = False, output_attentions: bool = False):
+        """
+        Forward pass for the VitTransformer.
+        Args:
+            x (torch.Tensor): Input tensor of shape [seq_len, batch, width].
+            output_hidden_states (bool): If True, returns all hidden states.
+            output_attentions (bool): If True, returns all attention weights from each block.
+        Returns:
+            Tuple: Depending on `output_hidden_states` and `output_attentions`, can include:
+                   - x: The final output tensor.
+                   - all_hidden_states: Tuple of hidden states from each block (if `output_hidden_states` is True).
+                   - all_attentions: Tuple of attention weights from each block (if `output_attentions` is True).
+        """
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None # Store attentions from each block
 
         for i, block in enumerate(self.resblocks):
-            x = block(x) # 각 블록 통과
-
-            # --- 게이팅 로직 적용 (블록 출력 후) ---
-            # 게이팅은 CLS 토큰을 변경하므로, 저장 시점 중요.
-            # HF 관례는 보통 레이어(블록) 출력 직후 저장. 게이팅은 레이어 이후의 추가 처리로 간주.
-            # 따라서 게이팅 *전*의 x를 저장하는 것이 일반적일 수 있으나,
-            # 여기서는 게이팅이 CLS 토큰 자체를 업데이트하므로, 업데이트 *후*의 상태가
-            # 다음 레이어의 입력에 더 가까울 수 있음. 여기서는 게이팅 *후*의 x를 저장.
+            # Pass output_attentions flag to each ResidualAttentionBlock
+            layer_outputs = block(x, output_attentions=output_attentions)
+            
+            current_block_output = layer_outputs
+            if output_attentions:
+                # If output_attentions was True, layer_outputs is a tuple (output, weights)
+                current_block_output = layer_outputs[0]
+                current_block_attentions = layer_outputs[1]
+                all_attentions = all_attentions + (current_block_attentions,)
+            
+            x = current_block_output # Update x with the output of the current block
+            
+            # Gating logic (remains unchanged)
             if self.intermediate_fusion_mlps is not None and (i + 1) >= self.gate_start_layer:
                 cls_token = x[0]                     # [batch, width]
                 reg_tokens = x[1:1+self.num_registers] # [num_registers, batch, width]
                 reg_summary = reg_tokens.mean(dim=0)   # [batch, width]
                 fusion_input = torch.cat([cls_token, reg_summary], dim=-1)  # [batch, 2*width]
-                gate_index = (i + 1) - self.gate_start_layer  # index into intermediate_fusion_mlps
+                gate_index = (i + 1) - self.gate_start_layer
                 gate = torch.sigmoid(self.intermediate_fusion_mlps[gate_index](fusion_input))  # [batch, 1]
-                fused = gate * cls_token + (1 - gate) * reg_summary  # fused representation
-                # Instead of an in-place update, create a new tensor for x:
-                x = torch.cat([fused.unsqueeze(0), x[1:]], dim=0) # 게이팅 적용된 x
+                fused = gate * cls_token + (1 - gate) * reg_summary
+                x = torch.cat([fused.unsqueeze(0), x[1:]], dim=0)
 
-            # --- 중간 출력 저장 ---
             if output_hidden_states:
-                # 현재 레이어(게이팅 포함)를 통과한 후의 상태 저장
-                all_hidden_states = all_hidden_states + (x,) # 튜플에 추가
+                all_hidden_states = all_hidden_states + (x,)
 
+        # Construct the tuple of return values based on the flags
+        return_values = [x] # The final output x is always returned first
         if output_hidden_states:
-            return x, all_hidden_states # 최종 출력과 중간 출력 튜플 반환
-        else:
-            return x # 최종 출력만 반환
+            return_values.append(all_hidden_states)
+        if output_attentions:
+            return_values.append(all_attentions)
+        
+        return tuple(return_values)
 
 
 
@@ -189,68 +277,83 @@ class VisionTransformer(nn.Module):
         # self.fusion_mlp = nn.Sequential(...)
 
 
-    def forward(self, x: torch.Tensor, output_hidden_states=False):
-        x = self.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1) # [B, num_patches, width]
+    # VisionTransformer.forward 메서드 수정
+    def forward(self, x: torch.Tensor, output_hidden_states: bool = False, output_attentions: bool = False):
+        """
+        Forward pass for the VisionTransformer.
+        Args:
+            x (torch.Tensor): Input image tensor.
+            output_hidden_states (bool): If True, returns all hidden states.
+            output_attentions (bool): If True, returns all attention weights from the transformer.
+        Returns:
+            BaseModelOutputWithPooling: An object containing last_hidden_state, pooler_output,
+                                        hidden_states (if requested), and attentions (if requested).
+        """
+        x = self.conv1(x)  # [B, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, width, num_patches]
+        x = x.permute(0, 2, 1)  # [B, num_patches, width]
 
-        cls_token = self.class_embedding.to(x.dtype).expand(x.shape[0], 1, -1) # [B, 1, width]
+        # Prepend class and register tokens
+        cls_token = self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device) # Batch-wise expansion
+        cls_token = cls_token.to(x.dtype) # Ensure dtype
         register_tokens = self.register_tokens.to(x.dtype).unsqueeze(0).expand(x.shape[0], -1, -1) # [B, num_reg, width]
+        
+        x = torch.cat([cls_token, register_tokens, x], dim=1)  # [B, 1 + num_reg + num_patches, width]
+        x = x + self.positional_embedding.to(x.dtype) # Positional embedding
 
-        x = torch.cat([cls_token, register_tokens, x], dim=1) # [B, SeqLen, width]
-        x = x + self.positional_embedding.to(x.dtype)
-
-        # --- ln_pre 적용 전 상태 저장 (선택적, HF는 보통 임베딩 출력 포함) ---
-        # hidden_states_before_ln_pre = x if output_hidden_states else None
-
-        x = self.ln_pre(x) # [B, SeqLen, H]
-
-        # --- 초기 입력 상태 저장 (ln_pre 후) ---
-        # 이게 hidden_states의 첫번째 요소가 됨 (HF 관례)
-        initial_hidden_state = x if output_hidden_states else None
-
-        x = x.permute(1, 0, 2)  # shape: [seq_len, batch, width]
-
-        # --- VitTransformer 호출 시 output_hidden_states 전달 ---
-        transformer_outputs = self.transformer(x, output_hidden_states=output_hidden_states)
-
-        # --- 결과 처리 ---
+        x = self.ln_pre(x) # Apply LayerNorm before transformer
+        
+        initial_hidden_state_for_output = None # For BaseModelOutputWithPooling
         if output_hidden_states:
-            # 최종 블록 출력과 중간 블록 출력들 분리
-            final_block_output = transformer_outputs[0] # [SeqLen, B, H]
-            intermediate_hidden_states_unpermuted = transformer_outputs[1] # 튜플: 각 요소 [SeqLen, B, H]
-        else:
-            final_block_output = transformer_outputs # [SeqLen, B, H]
-            intermediate_hidden_states_unpermuted = None
+            initial_hidden_state_for_output = x # Store state after ln_pre
 
-        # --- 최종 블록 출력을 원래 차원으로 복원 ---
-        x_final_permuted = final_block_output.permute(1, 0, 2)  # shape: [batch, seq_len, width]
+        x_permuted = x.permute(1, 0, 2)  # Transformer expects [seq_len, batch, width]
 
-        # --- 최종 LayerNorm 적용 ---
-        last_hidden_state = self.ln_post(x_final_permuted) # [B, SeqLen, 1024]
+        # Call the modified self.transformer (VitTransformer instance)
+        # It will return a tuple: (final_output, optional_hidden_states, optional_attentions)
+        transformer_outputs_tuple = self.transformer(
+            x_permuted,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions
+        )
 
-        # --- Pooler 출력 계산 ---
-        pooled_output = last_hidden_state[:, 0] # CLS token [B, 1024]
-
-        # --- hidden_states 튜플 구성 ---
-        all_hidden_states = None
+        # Unpack the outputs from VitTransformer
+        current_idx = 0
+        final_transformer_block_output = transformer_outputs_tuple[current_idx] # This is x after all resblocks
+        current_idx += 1
+        
+        intermediate_hidden_states_unpermuted = None
         if output_hidden_states:
-            # 1. 초기 입력 상태 (ln_pre 후)
-            all_hidden_states = (initial_hidden_state,)
+            intermediate_hidden_states_unpermuted = transformer_outputs_tuple[current_idx]
+            current_idx += 1
+            
+        vit_all_layer_attentions = None # Tuple of attentions from each VitTransformer layer
+        if output_attentions:
+            vit_all_layer_attentions = transformer_outputs_tuple[current_idx]
+            # current_idx +=1 # No more items expected if this was the last conditional output
 
-            # 2. 중간 블록 출력들 (차원 복원)
-            # intermediate_hidden_states_unpermuted는 None일 수 있으므로 체크
+        # Permute back to [batch, seq_len, width]
+        x_final_permuted_back = final_transformer_block_output.permute(1, 0, 2)
+        
+        last_hidden_state = self.ln_post(x_final_permuted_back) # Apply final LayerNorm
+        pooled_output = last_hidden_state[:, 0] # CLS token is at index 0 for pooled output
+
+        # Construct hidden_states tuple for output if requested
+        all_hidden_states_for_output = None
+        if output_hidden_states:
+            all_hidden_states_for_output = (initial_hidden_state_for_output,) # Start with ln_pre output
             if intermediate_hidden_states_unpermuted is not None:
                 for hidden_state_unpermuted in intermediate_hidden_states_unpermuted:
-                    hidden_state_permuted = hidden_state_unpermuted.permute(1, 0, 2) # [B, SeqLen, H]
-                    all_hidden_states = all_hidden_states + (hidden_state_permuted,)
-
-            # 3. 최종 출력 (ln_post 후) - HF는 보통 이것도 포함하지만, LLaVA는 last_hidden_state를 따로 쓰므로 생략 가능
-            # all_hidden_states = all_hidden_states + (last_hidden_state,) # 필요 시 이 라인 활성화
+                    # Permute each intermediate hidden state back to (B, L, E)
+                    all_hidden_states_for_output = all_hidden_states_for_output + (hidden_state_unpermuted.permute(1, 0, 2),)
+            # Optionally, add the very last_hidden_state (after final ln_post) to the tuple
+            # all_hidden_states_for_output = all_hidden_states_for_output + (last_hidden_state,)
 
         return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state, # 최종 출력 (ln_post 후)
+            last_hidden_state=last_hidden_state,
             pooler_output=pooled_output,
-            hidden_states=all_hidden_states    # 구성된 중간 출력 튜플 (또는 None)
+            hidden_states=all_hidden_states_for_output, # Tuple or None
+            attentions=vit_all_layer_attentions     # Tuple of attentions from VitTransformer or None
         )
 
 
@@ -367,28 +470,46 @@ class CLIP(nn.Module):
         return logits_per_image, logits_per_text
 
 
-def convert_weights(model: nn.Module):
-    """Convert applicable model parameters to fp16"""
+def convert_weights(model: nn.Module, target_dtype: torch.dtype): # 기본값 제거, 명시적 전달 강제
+    """Convert applicable model parameters and buffers to a target_dtype"""
+    print(f"  Attempting to convert model weights to {target_dtype}...")
+    conversion_count = 0
 
-    def _convert_weights_to_fp16(l):
-        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
-            l.weight.data = l.weight.data.half()
-            if l.bias is not None:
-                l.bias.data = l.bias.data.half()
+    def _convert_recursive(module: nn.Module):
+        nonlocal conversion_count
+        # 먼저 자식 모듈에 대해 재귀적으로 호출
+        for child_name, child_module in module.named_children():
+            _convert_recursive(child_module)
 
-        if isinstance(l, nn.MultiheadAttention):
-            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
-                tensor = getattr(l, attr)
-                if tensor is not None:
-                    tensor.data = tensor.data.half()
+        # 현재 모듈의 직접적인 파라미터 변환
+        for param_name, param in module.named_parameters(recurse=False): # recurse=False로 직접 파라미터만
+            if param.dtype != target_dtype:
+                try:
+                    param.data = param.data.to(dtype=target_dtype)
+                    if param.grad is not None and param.grad.dtype != target_dtype:
+                        param.grad.data = param.grad.data.to(dtype=target_dtype)
+                    # print(f"    Converted parameter '{param_name}' to {target_dtype}")
+                    conversion_count += 1
+                except Exception as e:
+                    print(f"    Error converting parameter '{param_name}': {e}")
+        
+        # 현재 모듈의 직접적인 버퍼 변환
+        for buffer_name, buffer_tensor in module.named_buffers(recurse=False): # recurse=False로 직접 버퍼만
+            if buffer_tensor.dtype != target_dtype and buffer_tensor.is_floating_point(): # 부동소수점 버퍼만 변환
+                try:
+                    # 버퍼는 _buffers 딕셔너리를 통해 직접 재할당
+                    module._buffers[buffer_name] = buffer_tensor.to(dtype=target_dtype)
+                    # print(f"    Converted buffer '{buffer_name}' to {target_dtype}")
+                    conversion_count +=1
+                except Exception as e:
+                    print(f"    Error converting buffer '{buffer_name}': {e}")
 
-        for name in ["text_projection", "proj"]:
-            if hasattr(l, name):
-                attr = getattr(l, name)
-                if attr is not None:
-                    attr.data = attr.data.half()
-
-    model.apply(_convert_weights_to_fp16)
+    _convert_recursive(model) # model.apply 대신 재귀 함수 사용으로 로그 상세화 가능
+    # model.apply(_convert_module_params_buffers) # 또는 apply 사용 유지
+    if conversion_count == 0:
+        print(f"  No weights needed conversion to {target_dtype}, or conversion failed silently for some.")
+    else:
+        print(f"  Successfully converted {conversion_count} parameters/buffers to {target_dtype}.")
 
 
 def adjust_state_dict(state_dict, regtoken_path="regtokens"):
@@ -426,56 +547,36 @@ def adjust_state_dict(state_dict, regtoken_path="regtokens"):
 
 
 # Modify the build_model function to adjust the state_dict before loading it
-def build_model(state_dict: dict, regtoken_path="regtokens"):
+def build_model(state_dict: dict, regtoken_path="regtokens", model_dtype: torch.dtype = torch.float16):
+    # ... (기존 model 구조 및 파라미터 계산 로직은 동일) ...
     vision_width = state_dict["visual.conv1.weight"].shape[0]
-    # --- vision_layers 계산 명확화 ---
-    # visual.transformer.resblocks.{i}.attn.in_proj_weight 형태의 키 개수 세기
     layer_indices = set()
     for k in state_dict.keys():
         if k.startswith("visual.transformer.resblocks.") and k.endswith(".attn.in_proj_weight"):
             try:
                 layer_indices.add(int(k.split('.')[3]))
             except (IndexError, ValueError):
-                continue # 형식에 맞지 않는 키는 무시
+                continue
     vision_layers = len(layer_indices)
-    if vision_layers == 0: # 만약 위 방식이 실패하면 원래 방식으로 시도
-         vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
-         print(f"Warning: Could not reliably determine vision_layers from resblock keys, using fallback method. Layers: {vision_layers}")
-
+    if vision_layers == 0:
+         vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")]) # fallback
 
     vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-    # --- num_registers 결정 ---
-    # state_dict에 'visual.register_tokens' 키가 있는지, 있다면 shape[0]을 사용
     if "visual.register_tokens" in state_dict:
         num_registers = state_dict["visual.register_tokens"].shape[0]
     else:
-        # state_dict에 없으면 positional_embedding 크기에서 추론 시도 (덜 안정적)
-        # pos_embed_len = 261 -> 1(CLS) + 4(REG) + 256(Patch) 가정
-        pos_embed_len = state_dict["visual.positional_embedding"].shape[0]
-        num_patches_plus_cls = (round((pos_embed_len - 1)**0.5))**2 + 1 # 예: (16*16)+1 = 257
-        estimated_registers = pos_embed_len - num_patches_plus_cls
-        if estimated_registers > 0 and estimated_registers < 10: # 비정상적인 값 필터링
-             num_registers = estimated_registers
-             print(f"Warning: 'visual.register_tokens' not found in state_dict. Estimated num_registers={num_registers} from positional embedding length {pos_embed_len}.")
-        else:
-             num_registers = 4 # 추론 실패 시 기본값
-             print(f"Warning: Could not determine num_registers from state_dict. Using default value: {num_registers}")
+        num_registers = 4 # 기본값 또는 다른 추론 로직
     print(f"Determined num_registers: {num_registers}")
 
-    # --- grid_size, image_resolution 계산 ---
-    # positional_embedding 크기 (num_tokens) 에서 CLS(1)와 REG(num_registers) 제외하고 루트 계산
     num_tokens = state_dict["visual.positional_embedding"].shape[0]
     num_patches_calc = num_tokens - 1 - num_registers
     if num_patches_calc <= 0:
-         raise ValueError(f"Calculated non-positive number of patches ({num_patches_calc}) from pos_embed_len={num_tokens}, num_registers={num_registers}")
+         raise ValueError(f"Calculated non-positive number of patches ({num_patches_calc})")
     grid_size = round(num_patches_calc ** 0.5)
     if grid_size * grid_size != num_patches_calc:
-         # 만약 제곱수가 아니면, 원래 방식(CLS만 제외) 시도
-         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
-         print(f"Warning: Positional embedding length {num_tokens} doesn't fit num_registers {num_registers}. Using fallback grid_size calculation.")
+         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5) # fallback
 
     image_resolution = vision_patch_size * grid_size
-
     embed_dim = state_dict["text_projection"].shape[1]
     context_length = state_dict["positional_embedding"].shape[0]
     vocab_size = state_dict["token_embedding.weight"].shape[0]
@@ -484,34 +585,26 @@ def build_model(state_dict: dict, regtoken_path="regtokens"):
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
 
     model = CLIP(
-        embed_dim=embed_dim,                # 키워드 인자
-        image_resolution=image_resolution,  # 키워드 인자
-        vision_layers=vision_layers,        # 키워드 인자
-        vision_width=vision_width,          # 키워드 인자
-        vision_patch_size=vision_patch_size,# 키워드 인자
-        num_registers=num_registers,        # 키워드 인자
-        context_length=context_length,      # 키워드 인자
-        vocab_size=vocab_size,              # 키워드 인자
-        transformer_width=transformer_width,# 키워드 인자
-        transformer_heads=transformer_heads,# 키워드 인자
-        transformer_layers=transformer_layers # 키워드 인자
+        embed_dim=embed_dim, image_resolution=image_resolution, vision_layers=vision_layers,
+        vision_width=vision_width, vision_patch_size=vision_patch_size, num_registers=num_registers,
+        context_length=context_length, vocab_size=vocab_size, transformer_width=transformer_width,
+        transformer_heads=transformer_heads, transformer_layers=transformer_layers
     )
 
-    for key in ["input_resolution", "context_length", "vocab_size"]:
-        if key in state_dict:
-            del state_dict[key]
+    for key_to_del in ["input_resolution", "context_length", "vocab_size"]: # 오타 수정
+        if key_to_del in state_dict:
+            del state_dict[key_to_del]
 
-    # adjust_state_dict 는 positional embedding 크기 조정 등에 필요할 수 있으므로 유지
-    # 단, register_tokens 주입 로직은 위에서 이미 처리했으므로 중복될 수 있음 (adjust_state_dict 내부 확인 필요)
-    # state_dict = adjust_state_dict(state_dict, regtoken_path)
-
-    convert_weights(model)
-    # --- load_state_dict 결과 출력 ---
     print("Loading state_dict into CLIP model (strict=False)...")
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     if missing_keys:
         print(f"  Missing keys: {missing_keys}")
     if unexpected_keys:
-        print(f"  Unexpected keys: {unexpected_keys}") # visual.proj 등이 나올 수 있음 (정상)
+        print(f"  Unexpected keys: {unexpected_keys}")
+
+    print(f"Data type of model.visual.conv1.weight BEFORE explicit convert_weights: {model.visual.conv1.weight.dtype}")
+    # model_dtype 인자가 torch.bfloat16으로 전달될 것임
+    convert_weights(model, target_dtype=model_dtype) 
+    print(f"Data type of model.visual.conv1.weight AFTER explicit convert_weights: {model.visual.conv1.weight.dtype}")
 
     return model.eval()

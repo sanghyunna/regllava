@@ -1,12 +1,15 @@
 from PIL import Image
 from io import BytesIO
 import base64
+import os
+from typing import List
 import torch
+from torchvision.transforms import Compose
 import math
 import ast
 
 from transformers import StoppingCriteria
-from llava.constants import IMAGE_TOKEN_INDEX
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
 def select_best_resolution(original_size, possible_resolutions):
@@ -163,23 +166,74 @@ def expand2square(pil_img, background_color):
         return result
 
 
-def process_images(images, image_processor, model_cfg):
+def process_images(images: List[Image.Image], image_processor, model_cfg): # images 타입 힌트 추가
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     new_images = []
+
     if image_aspect_ratio == 'pad':
         for image in images:
-            image = expand2square(image, tuple(int(x*255) for x in image_processor.image_mean))
-            image = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-            new_images.append(image)
+            background_color = tuple(int(x*255) for x in getattr(image_processor, 'image_mean', [0.48145466, 0.4578275, 0.40821073]))
+            image = expand2square(image, background_color)
+            
+            if hasattr(image_processor, 'preprocess'): # 표준 HF ImageProcessor
+                # preprocess는 보통 단일 이미지를 받고, 결과를 딕셔너리로 반환하며, 그 안에 'pixel_values'가 배치 차원 없이 있음
+                processed_image = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            elif isinstance(image_processor, Compose): # torchvision.transforms.Compose 객체
+                # Compose 객체는 보통 단일 이미지를 받아 단일 텐서(C, H, W)를 반환
+                processed_image = image_processor(image)
+                # reg_gated_transform이 (C,H,W) 텐서를 반환한다고 가정. 만약 다른 형태면 추가 처리 필요.
+            else:
+                raise TypeError(f"Unsupported image_processor type: {type(image_processor)}")
+            new_images.append(processed_image)
+
     elif image_aspect_ratio == "anyres":
         for image in images:
-            image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
-            new_images.append(image)
-    else:
-        return image_processor(images, return_tensors='pt')['pixel_values']
-    if all(x.shape == new_images[0].shape for x in new_images):
-        new_images = torch.stack(new_images, dim=0)
-    return new_images
+            # process_anyres_image 내부에서도 image_processor 타입에 따른 분기 처리가 필요함
+            # 여기서는 process_anyres_image가 이를 처리한다고 가정하고 호출
+            # 또는 process_anyres_image에 image_processor가 Compose인지 여부를 전달할 수 있음
+            processed_image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints, model_cfg) # model_cfg 전체 전달 고려
+            new_images.append(processed_image)
+            
+    else: # 'pad'나 'anyres'가 아닌 경우 (예: None 또는 다른 값)
+        if hasattr(image_processor, 'preprocess') and callable(getattr(image_processor, 'preprocess', None)):
+            # 표준 HF ImageProcessor: 이미지 리스트를 받아 처리하고 'pixel_values'로 딕셔너리 반환 기대
+            # (주의: HF ImageProcessor의 __call__ 메소드가 preprocess를 호출하는 경우가 많음)
+            # 가장 안전한 것은 ImageProcessor의 __call__ 인터페이스를 따르는 것
+            # image_processor(images, return_tensors='pt')는 보통 {'pixel_values': (B, C, H, W)}를 반환
+            # 이 경우, return image_processor(images, return_tensors='pt')['pixel_values']가 맞음
+            # 하지만 CLIPImageProcessor.__call__은 단일 이미지를 받아 pixel_values: (1,C,H,W) 를 반환 후 squeeze(0)
+            # 만약 images가 리스트라면, 반복 처리 필요
+            
+            # 우선, image_processor가 리스트를 직접 처리할 수 있는지 확인 (HF ImageProcessor의 일반적인 사용법)
+            try:
+                # image_processor가 __call__ 메소드에서 리스트와 return_tensors를 지원한다고 가정
+                return image_processor(images, return_tensors='pt')['pixel_values']
+            except Exception: # 만약 실패하면, 개별 처리
+                for image in images:
+                    # 단일 이미지에 대한 preprocess 호출 (결과는 (C,H,W) 가정)
+                    new_images.append(image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0])
+
+        elif isinstance(image_processor, Compose): # torchvision.transforms.Compose 객체
+            for image in images:
+                # Compose 객체는 단일 이미지를 받아 단일 텐서(C, H, W)를 반환
+                new_images.append(image_processor(image))
+        else:
+            raise TypeError(f"Unsupported image_processor type for general case: {type(image_processor)}")
+
+    # 모든 이미지가 동일한 형태인지 확인 후 스택 (이 부분은 유지)
+    if new_images and all(x.shape == new_images[0].shape for x in new_images):
+        new_images_stacked = torch.stack(new_images, dim=0) # (B, C, H, W)
+        return new_images_stacked
+    elif not new_images: # 처리된 이미지가 없는 경우
+        # 빈 리스트를 반환하거나, 빈 텐서를 반환하거나, 오류를 발생시킬 수 있음
+        # 여기서는 빈 텐서를 반환하는 예시 (형태는 상황에 맞게 조정)
+        # model_cfg에서 dtype 가져오기
+        target_dtype = getattr(model_cfg, 'torch_dtype', torch.float32)
+        return torch.empty((0, 3, getattr(image_processor, 'crop_size', {}).get('height', 224), getattr(image_processor, 'crop_size', {}).get('width', 224)), dtype=target_dtype)
+    else: # 스택할 수 없는 경우 (이미지 크기가 다를 때) - 이 경우는 로직상 발생하면 안됨
+        # 또는 리스트 그대로 반환 (LLaVA의 다른 부분이 리스트를 처리할 수 있다면)
+        # raise ValueError("Processed images have different shapes and cannot be stacked.")
+        return new_images # 혹은 오류 발생
 
 
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):

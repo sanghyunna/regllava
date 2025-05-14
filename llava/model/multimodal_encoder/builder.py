@@ -23,14 +23,15 @@ def build_vision_tower(vision_tower_cfg, training_args=None, **kwargs):
     if vision_tower is None:
         raise ValueError("`vision_tower_cfg` 에 vision_tower 경로가 정의돼 있지 않습니다.")
 
-    is_absolute_path = os.path.exists(vision_tower)
+    is_existing_path = os.path.exists(vision_tower)
 
     # 3) Reg-Gated, OpenAI, LAION, ShareGPT4V 모델만 지원
     if (
-        is_absolute_path
+        is_existing_path
         or vision_tower.startswith("openai")
         or vision_tower.startswith("laion")
         or "ShareGPT4V" in vision_tower
+        or "GATED" in vision_tower.upper()
     ):
         # CLIPVisionTower 시그니처: (vision_tower_path_or_name, args, delay_load=False)
         return CLIPVisionTower(
